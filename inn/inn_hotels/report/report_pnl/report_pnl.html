@@ -1,8 +1,14 @@
-<h3 class="text-left">{%= __("HOTEL DAILY INN") %}</h3>
+<h3 class="text-left">{%= filters.company_title || "" %}</h3>
 
-<p class="text-left">{%= __("Jl. Jenderal Ahmad Yani Kavling 67 Cempaka Putih Timur, Jakarta Pusat") %}</p>
-<p class="text-left">{%= __("Jakarta Indonesia. 10510") %}</p>
-<p class="text-left">{%= __("Phone: 021-21473999 Fax: 021-21473998") %}</p>
+{% if (filters.company_address) { %}
+<p class="text-left">{%= filters.company_address %}</p>
+{% } %}
+{% if (filters.company_phone) { %}
+<p class="text-left">{%= __("Phone") %}: {%= filters.company_phone %}</p>
+{% } %}
+{% if (filters.company_fax) { %}
+<p class="text-left">{%= __("Fax") %}: {%= filters.company_fax %}</p>
+{% } %}
 
 <hr>
 
@@ -245,7 +251,7 @@
 <div class="col-xs-2"><p class="text-left">{%= __("") %}</p></div>
 <div class="col-xs-3"><p class="text-left">{%= __("") %}</p></div>
 <div class="col-xs-3"><p class="text-left">{%= __("") %}</p></div>
-<div class="col-xs-3"><p class="text-left">{%= __("Jakarta,") %}</p></div>
+<div class="col-xs-3"><p class="text-left">{% if (filters.company_city) { %}{%= filters.company_city %},{% } %}</p></div>
 <div class="col-xs-1"><p class="text-left">{%= __("") %}</p></div>
 
 <div class="col-xs-2"><p class="text-left">{%= __("") %}</p></div>
