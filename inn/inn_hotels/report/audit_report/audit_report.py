@@ -1,298 +1,386 @@
+# -*- coding: utf-8 -*-
+# Copyright (c) 2025, PMM and contributors
+# For license information, please see license.txt
+"""Audit Report - the daily folio-level export.
+
+This is the report the front desk runs once per business date and pastes into
+the finance spreadsheet, so its column order is a de-facto interface: the 15
+original columns keep their names and positions, and new information is either
+written into columns that used to be emitted empty (``status``, ``paid_date``)
+or appended at the end (``audit_date``).
+
+What each row means
+-------------------
+One row per reservation that is in house on the report date, plus any
+reservation that has non-void activity on that date. Money columns aggregate
+only the transactions whose ``audit_date`` equals the report date.
+
+Fixed relative to the previous implementation
+---------------------------------------------
+``audit_date``      every row is dateable; the report date is no longer implied
+                    by the filter used at export time.
+``total_amount``    now every non-void credit, so ``Down Payment``, ``Payment``
+                    and ``Deposit`` collections are no longer dropped. The old
+                    code used two Inn Hotels Setting fields that were both
+                    ``Room Payment``.
+``status``          was always empty; now Paid / Partial / Unpaid as at the
+                    report date, reconstructed from ``audit_date <= date``.
+``mode_of_payment`` was a sliced concatenation (``[:-2]``); now clean,
+                    comma-joined Mode of Payment values.
+``paid_date``       was always empty; now the earliest payment date.
+``remark``          unchanged (``Inn Folio.bill_instructions``).
+
+The payment classification rules live in ``inn.helper.revenue_lines`` so this
+report and ``Front Desk Daily Revenue Recap`` cannot disagree.
+"""
+
 import frappe
-from datetime import date, timedelta
-from dateutil.parser import parse
+from frappe.utils import flt, today
+
+from inn.helper.revenue_lines import (
+    LINE_BREAKFAST,
+    LINE_COMMISSION,
+    LINE_ROOM,
+    classify,
+    get_line_map,
+    get_settings_context,
+    unmapped_types,
+)
 
 FILTER_FIELD_DATE = "expected_arrival"
 FILTER_FIELD_STATUS = "status"
+
 STATUS_RESERVED = "Reserved"
-TRANSACTION_TYPE_ROOM_REVENUE = ""
-TRANSACTION_TYPE_COMISSION = ""
-TRANSACTION_TYPE_BREAKFAST_REVENUE = ""
-TRANSACTION_TYPE_PAYMENT = ""
-TRANSACTION_TYPE_ROOM_PAYMENT = ""
-BREAKFAST_REVENUE_ACCOUNT = ""
-ROOM_REVENUE_ACCOUNT = ""
+STATUS_IN_HOUSE = "In House"
+STATUS_FINISH = "Finish"
 
-'''goals:
+STATUS_PAID = "Paid"
+STATUS_PARTIAL = "Partial"
+STATUS_UNPAID = "Unpaid"
 
-i want to see all reservation that have in house status in specified date
-from all those reservation i want all transaction from that specified date on those reservation
-
-question:
-
-- apa yang menandakan bahwa reservasi sedang berstatus in house pada tanggal tsb?
-jawab:
-opt1:  
-    - cek apakah reservasi sekarang berstatus in house memiliki expected date dibawah tanggal tersebut? 
-        => tandanya pada tanggal tersebut terdapat transaksi pada reservasi tersebut
-    - untuk reservasi status Reserved, Canceled, No Show berarti belum inhouse pada tanggal tersebut
-    - untuk reservasi status finished, check apakah actual arrival dan actual 
-        departure berada diantara tanggal tersebut 
-        => tandanya pada tanggal tersebut terdapat transaksi pada reservasi
-    - untuk seluruh transaksi pada reservasi, ambil transaksi yang terjadi pada tanggal tersebut
-
-
-'''
+#: A folio whose debits exceed its credits by no more than this is treated as
+#: settled. Rupiah rounding leaves sub-unit residue on some folios.
+SETTLEMENT_TOLERANCE = 1.0
 
 
 def execute(filters=None):
-    columns = [
-        {
-            'fieldname': 'rsv',
-            'label': 'RSV',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'customer',
-            'label': 'Customer',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'room_type',
-            'label': 'Room Type',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'actual_room',
-            'label': 'Actual Room',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'actual_room_rate',
-            'label': 'Actual Room Rate',
-            'fieldtype': 'Currency',
-            'width': 150,
-        },
-        {
-            'fieldname': 'actual_room_nett',
-            'label': 'Actual Room Nett',
-            'fieldtype': 'Currency',
-            'width': 150,
-        },
-        {
-            'fieldname': 'bf_revenue',
-            'label': 'BF Revenue',
-            'fieldtype': 'Currency',
-            'width': 150,
-        },
-        {
-            'fieldname': "comission",
-            'fieldtype': "Currency",
-            'label': "Comission",
-            'width': 150
-        },
-        {
-            'fieldname': 'payment_by',
-            'label': 'Payment By',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'status',
-            'label': 'Status',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'mode_of_payment',
-            'label': 'Mode of Payment',
-            'fieldtype': 'Data',
-            'width': 150,
-        },
-        {
-            'fieldname': 'total_amount',
-            'label': 'Total Amount',
-            'fieldtype': 'Currency',
-            'width': 150,
-        },
-        {
-            'fieldname': "posting_date",
-            "label": "Posting date",
-            'fieldtype': 'Date',
-            'width': 150
-        },
-        {
-            'fieldname': 'paid_date',
-            'label': 'Paid Date',
-            'fieldtype': 'Date',
-            'width': 150,
-        },
-        {
-            'fieldname': 'remark',
-            'label': 'Remark',
-            'fieldtype': 'Data',
-            'width': 150,
-        }
-    ]
-
+    columns = get_columns()
     data = get_data(filters)
-
     return columns, data
 
 
+def get_columns():
+    return [
+        {"fieldname": "rsv", "label": "RSV", "fieldtype": "Data", "width": 150},
+        {"fieldname": "customer", "label": "Customer", "fieldtype": "Data", "width": 150},
+        {"fieldname": "room_type", "label": "Room Type", "fieldtype": "Data", "width": 150},
+        {"fieldname": "actual_room", "label": "Actual Room", "fieldtype": "Data", "width": 150},
+        {"fieldname": "actual_room_rate", "label": "Actual Room Rate", "fieldtype": "Currency", "width": 150},
+        {"fieldname": "actual_room_nett", "label": "Actual Room Nett", "fieldtype": "Currency", "width": 150},
+        {"fieldname": "bf_revenue", "label": "BF Revenue", "fieldtype": "Currency", "width": 150},
+        {"fieldname": "comission", "label": "Comission", "fieldtype": "Currency", "width": 150},
+        {"fieldname": "payment_by", "label": "Payment By", "fieldtype": "Data", "width": 150},
+        {"fieldname": "status", "label": "Status", "fieldtype": "Data", "width": 150},
+        {"fieldname": "mode_of_payment", "label": "Mode of Payment", "fieldtype": "Data", "width": 150},
+        {"fieldname": "total_amount", "label": "Total Amount", "fieldtype": "Currency", "width": 150},
+        {"fieldname": "posting_date", "label": "Posting date", "fieldtype": "Date", "width": 150},
+        {"fieldname": "paid_date", "label": "Paid Date", "fieldtype": "Date", "width": 150},
+        {"fieldname": "remark", "label": "Remark", "fieldtype": "Data", "width": 150},
+        # Appended, never inserted: keeps the finance-team paste aligned.
+        {"fieldname": "audit_date", "label": "Audit Date", "fieldtype": "Date", "width": 110},
+    ]
+
+
 def get_data(filters):
-    if filters.date == None:
-        filters.date = date.today().isoformat()
+    filters = filters or frappe._dict()
 
-    return get_data_detail(filters.date, filters.fill_mode_payment)
+    on_date = filters.get("date") or today()
+
+    show_mode_of_payment = filters.get("fill_mode_payment")
+    if show_mode_of_payment is None:
+        show_mode_of_payment = 1
+
+    return get_data_detail(on_date, show_mode_of_payment)
 
 
-def get_data_detail(start_date, is_show_mode_payment):
-    query = f"""
-        select ir.name, ir.status, ir.customer_id, ir.room_type, ir.actual_room_id, ir.channel, ir.actual_room_rate, if.name as folio, if.bill_instructions
+def get_data_detail(on_date, is_show_mode_payment=True):
+    context = get_settings_context()
+    line_map = get_line_map(context)
+
+    reservations = get_reservations(on_date)
+    orphan_folios = get_folios_without_reservation(on_date)
+
+    folio_names = sorted(
+        {row.folio for row in reservations if row.folio}
+        | {folio.name for folio in orphan_folios}
+    )
+
+    if not folio_names:
+        return [
+            build_row(row, empty_detail(), "", is_show_mode_payment, on_date)
+            for row in reservations
+        ]
+
+    detail, unmapped = summarise_transactions(
+        get_transactions_for_date(folio_names, on_date), line_map
+    )
+    warn_unmapped_types(unmapped)
+
+    settlement = get_settlement_status(folio_names, on_date)
+
+    return [build_row(row, detail.get(row.folio) or empty_detail(),
+                      settlement.get(row.folio, ""), is_show_mode_payment, on_date)
+            for row in reservations] + [
+        build_orphan_row(folio, detail.get(folio.name) or empty_detail(),
+                         settlement.get(folio.name, ""), is_show_mode_payment, on_date)
+        for folio in orphan_folios
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Queries
+# ---------------------------------------------------------------------------
+def get_reservations(on_date):
+    """Reservations in house on ``on_date``, plus any with activity that day.
+
+    The original predicate (status plus expected dates) is preserved. The extra
+    branch guarantees a folio that moved money on the date is never dropped -
+    the spreadsheet these rows feed is a record of that day's postings.
+    """
+    active = get_reservations_with_activity(on_date)
+
+    query = """
+        select ir.name, ir.status, ir.customer_id, ir.room_type, ir.actual_room_id,
+               ir.channel, ir.actual_room_rate, folio.name as folio,
+               folio.bill_instructions
         from `tabInn Reservation` as ir
-        left join `tabInn Folio` as `if`
-        on if.reservation_id = ir.name
-        where 
-        (ir.status = 'In House' and ir.expected_arrival <= '{start_date}') or
-        (ir.status = 'Finish' and ir.expected_arrival <= '{start_date}' and ir.expected_departure > '{start_date}')
+        left join `tabInn Folio` as folio on folio.reservation_id = ir.name
+        where
+            (ir.status = %s and ir.expected_arrival <= %s)
+            or (ir.status = %s and ir.expected_arrival <= %s and ir.expected_departure > %s)
     """
+    params = [
+        STATUS_IN_HOUSE,
+        on_date,
+        STATUS_FINISH,
+        on_date,
+        on_date,
+    ]
 
-    reservation = frappe.db.sql(query=query, as_dict=1)
-    if len(reservation) == 0:
-        return []
+    if active:
+        query += " or ir.name in ({0})".format(", ".join(["%s"] * len(active)))
+        params.extend(active)
 
-    folio_name = tuple([x.folio for x in reservation])
-    folio_detail = get_folio_detail(folio_name, start_date)
+    query += " order by ir.name"
 
-    if is_show_mode_payment:
-        res = [
-            [x.name,
-             x.customer_id,
-             x.room_type,
-             x.actual_room_id,
-             folio_detail[x.folio]["actual_room_rate"],
-             folio_detail[x.folio]["actual_room_nett"],
-             folio_detail[x.folio]["breakfast_revenue"],
-             folio_detail[x.folio]["comission"],  # comission
-             x.channel,
-             "",
-             # mode of payment
-             folio_detail[x.folio]["mode_of_payment"][:-2],
-             folio_detail[x.folio]["total_amount"],
-             folio_detail[x.folio]["payment_date"],  # paid date
-             "",
-             x.bill_instructions
-             ]
-            for x in reservation]
-    else:
-        res = [
-            [x.name,
-             x.customer_id,
-             x.room_type,
-             x.actual_room_id,
-             folio_detail[x.folio]["actual_room_rate"],
-             folio_detail[x.folio]["actual_room_nett"],
-             folio_detail[x.folio]["breakfast_revenue"],
-             folio_detail[x.folio]["comission"],  # comission
-             x.channel,
-             "",
-             "",  # mode of payment
-             folio_detail[x.folio]["total_amount"],
-             folio_detail[x.folio]["payment_date"],  # paid date
-             "",
-             x.bill_instructions
-             ]
-            for x in reservation]
-
-    return res
+    return frappe.db.sql(query, tuple(params), as_dict=True)
 
 
-def get_folio_detail(folio_id: list, start_date: str):
-    # folio detail
-    # need data:
-    # actual room nett, breakfast revenue, mode of payment, total_amount (payment_amount?), payment_date
+def get_reservations_with_activity(on_date):
+    rows = frappe.db.sql(
+        """
+        select distinct folio.reservation_id
+        from `tabInn Folio Transaction` as trx
+        inner join `tabInn Folio` as folio on folio.name = trx.parent
+        where trx.audit_date = %s
+          and trx.is_void = 0
+          and folio.reservation_id is not null
+          and folio.reservation_id != ''
+        """,
+        (on_date,),
+    )
+    return [row[0] for row in rows]
 
-    fill_setting_data()
-    transaction_type_list = (TRANSACTION_TYPE_COMISSION, TRANSACTION_TYPE_ROOM_REVENUE,
-                             TRANSACTION_TYPE_BREAKFAST_REVENUE, TRANSACTION_TYPE_PAYMENT, TRANSACTION_TYPE_ROOM_PAYMENT)
 
-    if (len(folio_id) == 1):
-        folio_id_query = f"= '{folio_id[0]}'"
-    else:
-        folio_id_query = f'in {folio_id}'
+def get_folios_without_reservation(on_date):
+    """Folios that moved money on ``on_date`` but belong to no reservation.
 
-    query = f"""
-        select parent, transaction_type, amount, mode_of_payment, creation, actual_room_rate
-        from `tabInn Folio Transaction` as ift
-        where ift.parent {folio_id_query}
-        and
-        ift.transaction_type in {transaction_type_list} and
-        ift.audit_date = '{start_date}'
+    ``Inn Folio.type`` is ``Guest``, ``Master`` or ``Desk``. Desk and Master
+    folios carry no ``reservation_id``, so a reservation-driven report silently
+    drops their money - 912,500 of one November on the Bandung bench. They are
+    emitted as their own rows so the day's collections still tie out.
     """
-    print(query)
-    folio_detail = frappe.db.sql(query=query, as_dict=1)
-    res = {folio: {
+    return frappe.db.sql(
+        """
+        select folio.name, folio.type, folio.customer_id, folio.channel,
+               folio.bill_instructions
+        from `tabInn Folio Transaction` as trx
+        inner join `tabInn Folio` as folio on folio.name = trx.parent
+        left join `tabInn Reservation` as res on res.name = folio.reservation_id
+        where trx.audit_date = %s
+          and trx.is_void = 0
+          and res.name is null
+        group by folio.name, folio.type, folio.customer_id, folio.channel,
+                 folio.bill_instructions
+        order by folio.name
+        """,
+        (on_date,),
+        as_dict=True,
+    )
+
+
+def get_transactions_for_date(folio_names, on_date):
+    placeholders = ", ".join(["%s"] * len(folio_names))
+    return frappe.db.sql(
+        """
+        select parent, transaction_type, flag, amount, mode_of_payment,
+               creation, actual_room_rate
+        from `tabInn Folio Transaction`
+        where parent in ({0})
+          and audit_date = %s
+          and is_void = 0
+        order by creation, name
+        """.format(placeholders),
+        tuple(folio_names) + (on_date,),
+        as_dict=True,
+    )
+
+
+def get_settlement_status(folio_names, on_date):
+    """Paid / Partial / Unpaid per folio, as at ``on_date``.
+
+    Reconstructed from the transactions up to and including ``on_date`` rather
+    than read from ``Inn Folio.balance``, which only reflects the current state
+    and would be wrong whenever the report is re-run for a past date.
+    """
+    placeholders = ", ".join(["%s"] * len(folio_names))
+    rows = frappe.db.sql(
+        """
+        select parent,
+               sum(case when flag = 'Debit' then amount else 0 end) as debit,
+               sum(case when flag = 'Credit' then amount else 0 end) as credit
+        from `tabInn Folio Transaction`
+        where parent in ({0})
+          and audit_date <= %s
+          and is_void = 0
+        group by parent
+        """.format(placeholders),
+        tuple(folio_names) + (on_date,),
+        as_dict=True,
+    )
+
+    settlement = {}
+    for row in rows:
+        debit = flt(row.debit)
+        credit = flt(row.credit)
+        if debit - credit <= SETTLEMENT_TOLERANCE:
+            settlement[row.parent] = STATUS_PAID
+        elif credit > 0:
+            settlement[row.parent] = STATUS_PARTIAL
+        else:
+            settlement[row.parent] = STATUS_UNPAID
+    return settlement
+
+
+# ---------------------------------------------------------------------------
+# Row shaping
+# ---------------------------------------------------------------------------
+def empty_detail():
+    return {
         "actual_room_rate": 0,
         "actual_room_nett": 0,
         "breakfast_revenue": 0,
-        "mode_of_payment": "",
+        "comission": 0,
         "total_amount": 0,
-        "payment_date": "",
-        "comission": 0
-    } for folio in folio_id}
-
-    for data in folio_detail:
-        # populate aggrate folio data detail, grouped by folio number
-        if data.transaction_type == TRANSACTION_TYPE_ROOM_REVENUE:
-            res[data.parent]["actual_room_nett"] += data.amount
-            print(data)
-            res[data.parent]["actual_room_rate"] = data.actual_room_rate
-        elif data.transaction_type == TRANSACTION_TYPE_PAYMENT or data.transaction_type == TRANSACTION_TYPE_ROOM_PAYMENT:
-            res[data.parent]["mode_of_payment"] += f"BY {data.mode_of_payment} {data.amount:,}".replace(
-                ",", ".") + ", "
-            res[data.parent]["total_amount"] += data.amount
-            res[data.parent]["payment_date"] += f"{data.creation}, "
-        elif data.transaction_type == TRANSACTION_TYPE_BREAKFAST_REVENUE:
-            res[data.parent]["breakfast_revenue"] += data.amount
-        elif data.transaction_type == TRANSACTION_TYPE_COMISSION:
-            res[data.parent]["comission"] += data.amount
-
-    return res
+        "modes": set(),
+        "creations": [],
+    }
 
 
-def fill_setting_data():
-    # get data setting
-    global TRANSACTION_TYPE_COMISSION, TRANSACTION_TYPE_ROOM_REVENUE, TRANSACTION_TYPE_BREAKFAST_REVENUE, TRANSACTION_TYPE_PAYMENT, TRANSACTION_TYPE_ROOM_PAYMENT, BREAKFAST_REVENUE_ACCOUNT, ROOM_REVENUE_ACCOUNT
-    transaction_type = frappe.db.get_values_from_single(fields=["profit_sharing_transaction_type", "room_revenue_transaction_type", "breakfast_revenue_transaction_type", "customer_payment_transaction_type",
-                                                        "customer_room_payment_transaction_type", "breakfast_revenue_account", "room_revenue_account"], filters="", doctype="Inn Hotels Setting", as_dict=True)[0]
-    if transaction_type.profit_sharing_transaction_type == None:
-        TRANSACTION_TYPE_COMISSION = "Comission Channel"
-    else:
-        TRANSACTION_TYPE_COMISSION = transaction_type.profit_sharing_transaction_type
+def summarise_transactions(transactions, line_map):
+    detail = {}
+    charge_types = set()
 
-    if transaction_type.room_revenue_transaction_type == None:
-        TRANSACTION_TYPE_ROOM_REVENUE = "Room Charge"
-    else:
-        TRANSACTION_TYPE_ROOM_REVENUE = transaction_type.room_revenue_transaction_type
+    for trx in transactions:
+        bucket = detail.setdefault(trx.parent, empty_detail())
+        amount = flt(trx.amount)
 
-    if transaction_type.breakfast_revenue_transaction_type == None:
-        TRANSACTION_TYPE_BREAKFAST_REVENUE = "Breakfast Charge"
-    else:
-        TRANSACTION_TYPE_BREAKFAST_REVENUE = transaction_type.breakfast_revenue_transaction_type
+        # Collections: every credit is money received (payment types are not
+        # revenue lines and are deliberately not classified). Refunds are debits
+        # in this app, so they are naturally excluded.
+        if (trx.flag or "").strip().lower() == "credit":
+            bucket["total_amount"] += amount
+            if trx.mode_of_payment:
+                bucket["modes"].add(trx.mode_of_payment)
+            if trx.creation:
+                bucket["creations"].append(trx.creation)
+            continue
 
-    if transaction_type.customer_payment_transaction_type == None:
-        TRANSACTION_TYPE_PAYMENT = "Payment"
-    else:
-        TRANSACTION_TYPE_PAYMENT = transaction_type.customer_payment_transaction_type
+        charge_types.add(trx.transaction_type)
+        line = classify(trx.transaction_type, line_map)
 
-    if transaction_type.customer_room_payment_transaction_type == None:
-        TRANSACTION_TYPE_ROOM_PAYMENT = "Room Payment"
-    else:
-        TRANSACTION_TYPE_ROOM_PAYMENT = transaction_type.customer_room_payment_transaction_type
+        if line == LINE_ROOM:
+            bucket["actual_room_nett"] += amount
+            if trx.actual_room_rate:
+                bucket["actual_room_rate"] = flt(trx.actual_room_rate)
+        elif line == LINE_BREAKFAST:
+            bucket["breakfast_revenue"] += amount
+        elif line == LINE_COMMISSION:
+            bucket["comission"] += amount
 
-    if transaction_type.breakfast_revenue_account == None:
-        raise ImportError(
-            "Breakfast Revenue Account in Inn Hotels Setting not set yet")
-    else:
-        BREAKFAST_REVENUE_ACCOUNT = transaction_type.breakfast_revenue_account
+    # Only charge types can be "unmapped"; a payment type has no revenue line by
+    # design and must not be reported as a gap.
+    unmapped = unmapped_types(charge_types, line_map)
+    return detail, unmapped
 
-    if transaction_type.room_revenue_account == None:
-        raise ImportError(
-            "Room Revenue Account in Inn Hotels Setting not set yet")
-    else:
-        ROOM_REVENUE_ACCOUNT = transaction_type.room_revenue_account
+
+def warn_unmapped_types(unmapped):
+    if not unmapped:
+        return
+    frappe.msgprint(
+        msg="Transaction types with no revenue mapping, counted as Other: {0}".format(
+            ", ".join(unmapped)
+        ),
+        title="Unmapped transaction types",
+        indicator="orange",
+    )
+
+
+def build_orphan_row(folio, detail, settlement_status, is_show_mode_payment, on_date):
+    """Row for a Desk/Master folio that has no reservation.
+
+    ``rsv`` carries the folio name so the row stays traceable, and the folio
+    type is stated in the remark. Same 16 columns as every other row.
+    """
+    remark = "{0} folio {1}".format(folio.type or "Non-guest", folio.name)
+    if folio.bill_instructions:
+        remark = "{0}: {1}".format(remark, folio.bill_instructions)
+
+    return build_row(
+        frappe._dict(
+            name=folio.name,
+            customer_id=folio.customer_id,
+            room_type="",
+            actual_room_id="",
+            channel=folio.channel,
+            bill_instructions=remark,
+        ),
+        detail,
+        settlement_status,
+        is_show_mode_payment,
+        on_date,
+    )
+
+
+def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_date):
+    creations = detail.get("creations") or []
+    mode_of_payment = ", ".join(sorted(detail.get("modes") or [])) if is_show_mode_payment else ""
+
+    return [
+        reservation.name,
+        reservation.customer_id,
+        reservation.room_type,
+        reservation.actual_room_id,
+        detail.get("actual_room_rate", 0),
+        detail.get("actual_room_nett", 0),
+        detail.get("breakfast_revenue", 0),
+        detail.get("comission", 0),
+        reservation.channel,
+        settlement_status,
+        mode_of_payment,
+        detail.get("total_amount", 0),
+        ", ".join(str(creation) for creation in creations),
+        creations[0].date().isoformat() if creations else "",
+        reservation.bill_instructions,
+        on_date,
+    ]
