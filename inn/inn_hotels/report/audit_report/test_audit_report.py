@@ -36,6 +36,22 @@ LINE_MAP = {
 ON_DATE = "2025-11-05"
 
 
+def column_index(fieldname):
+    """Position of ``fieldname`` in the emitted columns.
+
+    Resolved by name rather than hard-coded: the report's column order is an
+    interface, so a test that pins raw slot numbers has to be rewritten every
+    time a column is inserted -- which is exactly how a real misalignment would
+    slip through unnoticed.
+    """
+    fieldnames = [column["fieldname"] for column in audit_report.get_columns()]
+    return fieldnames.index(fieldname)
+
+
+def row_value(row, fieldname):
+    return row[column_index(fieldname)]
+
+
 def trx(transaction_type, flag, amount, mode=None, rate=None, creation=None):
     return frappe._dict(
         parent="F-1",
@@ -51,20 +67,27 @@ def trx(transaction_type, flag, amount, mode=None, rate=None, creation=None):
 class TestAuditReportColumns(unittest.TestCase):
     def test_column_count_and_audit_date_appended(self):
         columns = audit_report.get_columns()
-        self.assertEqual(len(columns), 16)
+        self.assertEqual(len(columns), 17)
+        self.assertEqual(columns[0]["fieldname"], "rsv")
         self.assertEqual(columns[-1]["fieldname"], "audit_date")
         for column in columns:
             self.assertTrue(column.get("label"), column)
 
     def test_original_column_order_preserved(self):
-        """The finance team's paste depends on these positions."""
+        """The finance team's paste depends on these positions.
+
+        ``bed_type`` is deliberately inserted after ``room_type``, so the
+        original columns keep their names but everything from ``actual_room``
+        onward moves one slot right. ``audit_date`` stays last.
+        """
         fieldnames = [column["fieldname"] for column in audit_report.get_columns()]
         self.assertEqual(
-            fieldnames[:15],
+            fieldnames,
             [
                 "rsv",
                 "customer",
                 "room_type",
+                "bed_type",
                 "actual_room",
                 "actual_room_rate",
                 "actual_room_nett",
@@ -77,8 +100,16 @@ class TestAuditReportColumns(unittest.TestCase):
                 "posting_date",
                 "paid_date",
                 "remark",
+                "audit_date",
             ],
         )
+
+    def test_bed_type_sits_directly_after_room_type(self):
+        self.assertEqual(
+            column_index("bed_type"), column_index("room_type") + 1
+        )
+        columns = audit_report.get_columns()
+        self.assertEqual(columns[column_index("bed_type")]["label"], "Bed Type")
 
 
 class TestAuditReportAggregation(unittest.TestCase):
@@ -222,18 +253,28 @@ class TestAuditReportRowShaping(unittest.TestCase):
                          channel="", bill_instructions=None),
             self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
         )
-        self.assertEqual(row[15], ON_DATE)
-        self.assertEqual(row[13], "2025-11-06")
+        self.assertEqual(row_value(row, "audit_date"), ON_DATE)
+        self.assertEqual(row_value(row, "paid_date"), "2025-11-06")
         # posting_date keeps the original postings, oldest first
-        self.assertTrue(row[12].startswith("2025-11-06 00:30"))
+        self.assertTrue(row_value(row, "posting_date").startswith("2025-11-06 00:30"))
+
+    def test_bed_type_is_emitted_for_a_reservation(self):
+        row = audit_report.build_row(
+            frappe._dict(name="RSV-1", customer_id="C", room_type="Deluxe",
+                         bed_type="Queen", actual_room_id="R-101", channel="",
+                         bill_instructions=None),
+            self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
+        )
+        self.assertEqual(row_value(row, "bed_type"), "Queen")
+        self.assertEqual(row_value(row, "room_type"), "Deluxe")
 
     def test_mode_suppressed_when_filter_off(self):
         row = audit_report.build_row(
-            frappe._dict(name="RSV-1", customer_id="C", room_type="", actual_room_id="",
-                         channel="", bill_instructions=None),
+            frappe._dict(name="RSV-1", customer_id="C", room_type="", bed_type="",
+                         actual_room_id="", channel="", bill_instructions=None),
             self.detail, audit_report.STATUS_PAID, 0, ON_DATE,
         )
-        self.assertEqual(row[10], "")
+        self.assertEqual(row_value(row, "mode_of_payment"), "")
 
     def test_orphan_folio_row_keeps_contract_and_names_the_folio(self):
         row = audit_report.build_orphan_row(
@@ -242,26 +283,33 @@ class TestAuditReportRowShaping(unittest.TestCase):
             self.detail, audit_report.STATUS_PAID, 1, ON_DATE,
         )
         self.assertEqual(len(row), len(audit_report.get_columns()))
-        self.assertEqual(row[0], "F-16280")
-        self.assertIn("Desk folio F-16280", row[14])
-        self.assertIn("misc", row[14])
+        self.assertEqual(row_value(row, "rsv"), "F-16280")
+        # A folio with no reservation has no bed type, exactly as it has no room type.
+        self.assertEqual(row_value(row, "bed_type"), "")
+        self.assertEqual(row_value(row, "room_type"), "")
+        self.assertIn("Desk folio F-16280", row_value(row, "remark"))
+        self.assertIn("misc", row_value(row, "remark"))
 
     def test_reservation_with_no_folio_yields_zero_row(self):
         """A reservation with no folio and blank status: zeros, not an error."""
         row = audit_report.build_row(
             frappe._dict(name="RSV-NOFOLIO", customer_id="CUST-1", room_type="Deluxe",
-                         actual_room_id="R-101", channel="Walk In", bill_instructions=None),
+                         bed_type="King", actual_room_id="R-101", channel="Walk In",
+                         bill_instructions=None),
             audit_report.empty_detail(), "", 1, ON_DATE,
         )
         self.assertEqual(len(row), len(audit_report.get_columns()))
-        self.assertEqual(row[0], "RSV-NOFOLIO")
-        for index in (4, 5, 6, 7, 11):
-            self.assertEqual(row[index], 0, "column %d should be zero" % index)
-        self.assertEqual(row[9], "")
-        self.assertEqual(row[10], "")
-        self.assertEqual(row[12], "")
-        self.assertEqual(row[13], "")
-        self.assertEqual(row[15], ON_DATE)
+        self.assertEqual(row_value(row, "rsv"), "RSV-NOFOLIO")
+        self.assertEqual(row_value(row, "bed_type"), "King")
+        for fieldname in ("actual_room_rate", "actual_room_nett", "bf_revenue",
+                          "comission", "total_amount"):
+            self.assertEqual(row_value(row, fieldname), 0,
+                             "%s should be zero" % fieldname)
+        self.assertEqual(row_value(row, "status"), "")
+        self.assertEqual(row_value(row, "mode_of_payment"), "")
+        self.assertEqual(row_value(row, "posting_date"), "")
+        self.assertEqual(row_value(row, "paid_date"), "")
+        self.assertEqual(row_value(row, "audit_date"), ON_DATE)
 
 
 class TestAuditReportWithoutFolios(unittest.TestCase):
@@ -274,11 +322,13 @@ class TestAuditReportWithoutFolios(unittest.TestCase):
     def test_reservations_without_any_folio_still_produce_rows(self):
         reservations = [
             frappe._dict(name="RSV-NOFOLIO-A", status="In House", customer_id="CUST-1",
-                         room_type="Deluxe", actual_room_id="R-101", channel="Walk In",
-                         actual_room_rate=550000, folio=None, bill_instructions=None),
+                         room_type="Deluxe", bed_type="Queen", actual_room_id="R-101",
+                         channel="Walk In", actual_room_rate=550000, folio=None,
+                         bill_instructions=None),
             frappe._dict(name="RSV-NOFOLIO-B", status="Finish", customer_id="CUST-2",
-                         room_type="Superior", actual_room_id="R-202", channel="Traveloka",
-                         actual_room_rate=410000, folio=None, bill_instructions=None),
+                         room_type="Superior", bed_type="Twin", actual_room_id="R-202",
+                         channel="Traveloka", actual_room_rate=410000, folio=None,
+                         bill_instructions=None),
         ]
 
         with mock.patch.object(audit_report, "get_reservations", return_value=reservations), \
@@ -288,10 +338,11 @@ class TestAuditReportWithoutFolios(unittest.TestCase):
         self.assertEqual(len(rows), len(reservations))
         for row, reservation in zip(rows, reservations):
             self.assertEqual(len(row), len(audit_report.get_columns()))
-            self.assertEqual(row[0], reservation.name)
-            self.assertEqual(row[11], 0)
-            self.assertEqual(row[9], "")
-            self.assertEqual(row[15], ON_DATE)
+            self.assertEqual(row_value(row, "rsv"), reservation.name)
+            self.assertEqual(row_value(row, "bed_type"), reservation.bed_type)
+            self.assertEqual(row_value(row, "total_amount"), 0)
+            self.assertEqual(row_value(row, "status"), "")
+            self.assertEqual(row_value(row, "audit_date"), ON_DATE)
 
     def test_no_folios_and_no_reservations_returns_nothing(self):
         with mock.patch.object(audit_report, "get_reservations", return_value=[]), \
@@ -315,6 +366,8 @@ class TestAuditReportWithoutFolios(unittest.TestCase):
             rows = audit_report.get_data_detail(ON_DATE, 1)
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], "F-16280")
-        self.assertEqual(rows[0][11], 912500)
-        self.assertEqual(rows[0][9], audit_report.STATUS_UNPAID)
+        self.assertEqual(len(rows[0]), len(audit_report.get_columns()))
+        self.assertEqual(row_value(rows[0], "rsv"), "F-16280")
+        self.assertEqual(row_value(rows[0], "bed_type"), "")
+        self.assertEqual(row_value(rows[0], "total_amount"), 912500)
+        self.assertEqual(row_value(rows[0], "status"), audit_report.STATUS_UNPAID)

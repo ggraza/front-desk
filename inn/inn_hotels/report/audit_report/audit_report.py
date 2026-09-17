@@ -4,10 +4,17 @@
 """Audit Report - the daily folio-level export.
 
 This is the report the front desk runs once per business date and pastes into
-the finance spreadsheet, so its column order is a de-facto interface: the 15
-original columns keep their names and positions, and new information is either
-written into columns that used to be emitted empty (``status``, ``paid_date``)
-or appended at the end (``audit_date``).
+the finance spreadsheet, so its column order is a de-facto interface.
+
+Column contract: the original 15 columns keep their **names**, but they no
+longer all keep their positions. ``bed_type`` is inserted at slot 3, directly
+after ``room_type``, because a bed type read apart from the room it belongs to
+is useless; ``audit_date`` is appended last. Inserting at slot 3 shifts every
+column from ``actual_room`` onward, so ``audit_date`` sits at slot 16, not 15.
+A positionally-aligned paste into a spreadsheet laid out for the previous
+column set must therefore insert one column after ``Room Type``; a
+header-based paste is unaffected. ``ROW_FIELDS`` below is the single source of
+truth for that order.
 
 What each row means
 -------------------
@@ -69,25 +76,36 @@ def execute(filters=None):
     return columns, data
 
 
+#: The emitted column order: ``(fieldname, label, fieldtype, width)``.
+#: ``get_columns`` and ``build_row`` both follow this list, so the column
+#: definitions and the positional row values cannot drift apart.
+ROW_FIELDS = (
+    ("rsv", "RSV", "Data", 150),
+    ("customer", "Customer", "Data", 150),
+    ("room_type", "Room Type", "Data", 150),
+    ("bed_type", "Bed Type", "Data", 150),
+    ("actual_room", "Actual Room", "Data", 150),
+    ("actual_room_rate", "Actual Room Rate", "Currency", 150),
+    ("actual_room_nett", "Actual Room Nett", "Currency", 150),
+    ("bf_revenue", "BF Revenue", "Currency", 150),
+    ("comission", "Comission", "Currency", 150),
+    ("payment_by", "Payment By", "Data", 150),
+    ("status", "Status", "Data", 150),
+    ("mode_of_payment", "Mode of Payment", "Data", 150),
+    ("total_amount", "Total Amount", "Currency", 150),
+    ("posting_date", "Posting date", "Date", 150),
+    ("paid_date", "Paid Date", "Date", 150),
+    ("remark", "Remark", "Data", 150),
+    ("audit_date", "Audit Date", "Date", 110),
+)
+
+COLUMN_FIELDS = [field[0] for field in ROW_FIELDS]
+
+
 def get_columns():
     return [
-        {"fieldname": "rsv", "label": "RSV", "fieldtype": "Data", "width": 150},
-        {"fieldname": "customer", "label": "Customer", "fieldtype": "Data", "width": 150},
-        {"fieldname": "room_type", "label": "Room Type", "fieldtype": "Data", "width": 150},
-        {"fieldname": "actual_room", "label": "Actual Room", "fieldtype": "Data", "width": 150},
-        {"fieldname": "actual_room_rate", "label": "Actual Room Rate", "fieldtype": "Currency", "width": 150},
-        {"fieldname": "actual_room_nett", "label": "Actual Room Nett", "fieldtype": "Currency", "width": 150},
-        {"fieldname": "bf_revenue", "label": "BF Revenue", "fieldtype": "Currency", "width": 150},
-        {"fieldname": "comission", "label": "Comission", "fieldtype": "Currency", "width": 150},
-        {"fieldname": "payment_by", "label": "Payment By", "fieldtype": "Data", "width": 150},
-        {"fieldname": "status", "label": "Status", "fieldtype": "Data", "width": 150},
-        {"fieldname": "mode_of_payment", "label": "Mode of Payment", "fieldtype": "Data", "width": 150},
-        {"fieldname": "total_amount", "label": "Total Amount", "fieldtype": "Currency", "width": 150},
-        {"fieldname": "posting_date", "label": "Posting date", "fieldtype": "Date", "width": 150},
-        {"fieldname": "paid_date", "label": "Paid Date", "fieldtype": "Date", "width": 150},
-        {"fieldname": "remark", "label": "Remark", "fieldtype": "Data", "width": 150},
-        # Appended, never inserted: keeps the finance-team paste aligned.
-        {"fieldname": "audit_date", "label": "Audit Date", "fieldtype": "Date", "width": 110},
+        {"fieldname": fieldname, "label": label, "fieldtype": fieldtype, "width": width}
+        for fieldname, label, fieldtype, width in ROW_FIELDS
     ]
 
 
@@ -150,9 +168,9 @@ def get_reservations(on_date):
     active = get_reservations_with_activity(on_date)
 
     query = """
-        select ir.name, ir.status, ir.customer_id, ir.room_type, ir.actual_room_id,
-               ir.channel, ir.actual_room_rate, folio.name as folio,
-               folio.bill_instructions
+        select ir.name, ir.status, ir.customer_id, ir.room_type, ir.bed_type,
+               ir.actual_room_id, ir.channel, ir.actual_room_rate,
+               folio.name as folio, folio.bill_instructions
         from `tabInn Reservation` as ir
         left join `tabInn Folio` as folio on folio.reservation_id = ir.name
         where
@@ -351,6 +369,7 @@ def build_orphan_row(folio, detail, settlement_status, is_show_mode_payment, on_
             name=folio.name,
             customer_id=folio.customer_id,
             room_type="",
+            bed_type="",
             actual_room_id="",
             channel=folio.channel,
             bill_instructions=remark,
@@ -370,6 +389,7 @@ def build_row(reservation, detail, settlement_status, is_show_mode_payment, on_d
         reservation.name,
         reservation.customer_id,
         reservation.room_type,
+        reservation.bed_type,
         reservation.actual_room_id,
         detail.get("actual_room_rate", 0),
         detail.get("actual_room_nett", 0),
